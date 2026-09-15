@@ -353,9 +353,47 @@ type EncoderConfig struct {
 	// Configure the encoder for interface{} type objects.
 	// If not provided, objects are encoded using json.Encoder
 	NewReflectedEncoder func(io.Writer) ReflectedEncoder `json:"-" yaml:"-"`
-	// Configures the field separator used by the console encoder. Defaults
+	// Configure the field separator used by the console encoder. Defaults
 	// to tab.
 	ConsoleSeparator string `json:"consoleSeparator" yaml:"consoleSeparator"`
+
+	// MaxFields limits the total number of business fields encoded in a
+	// single log entry. If non-positive (the default), the number of fields
+	// is unlimited.
+	//
+	// Every user-supplied key-value pair counts as a field: fields passed at
+	// the log site, fields accumulated on the logger with With, fields
+	// produced by ObjectMarshalers and ArrayMarshalers, inlined fields
+	// (zap.Inline), namespaces, and members of reflected (zap.Reflect)
+	// values. Fields with duplicate keys are counted separately. The entry
+	// metadata (level, time, logger name, caller, message, and stacktrace)
+	// is not counted.
+	//
+	// When an entry exceeds the limit, encoding of the remaining fields is
+	// abandoned, the whole entry is dropped (nothing is written), and a
+	// *FieldLimitError is returned from EncodeEntry. Limits are enforced
+	// independently for each entry, so dropping one entry doesn't affect
+	// any other entry, including entries encoded concurrently.
+	MaxFields int `json:"maxFields" yaml:"maxFields"`
+	// MaxDepth limits the nesting depth of a single log entry. If
+	// non-positive (the default), nesting depth is unlimited.
+	//
+	// Objects (zap.Object), namespaces (zap.Namespace), arrays, and objects
+	// and arrays inside reflected (zap.Reflect) values each add a nesting
+	// level; inlined fields (zap.Inline) do not. The entry itself is depth 0.
+	//
+	// As with MaxFields, an entry that exceeds the depth limit is dropped in
+	// its entirety and reported with a *FieldLimitError.
+	MaxDepth int `json:"maxDepth" yaml:"maxDepth"`
+	// OnFieldLimit, if non-nil, is called once for every entry that is
+	// dropped because it exceeded MaxFields or MaxDepth. The same
+	// *FieldLimitError is then returned from EncodeEntry and reported on the
+	// logger's error output as a write error.
+	//
+	// Entries may be encoded concurrently, so the callback must be safe for
+	// concurrent use; it should also be fast and must not block. The Entry
+	// is pooled and must not be retained.
+	OnFieldLimit func(Entry, FieldLimitError) `json:"-" yaml:"-"`
 }
 
 // ObjectEncoder is a strongly-typed, encoding-agnostic interface for adding a

@@ -48,6 +48,10 @@ func putJSONEncoder(enc *jsonEncoder) {
 	enc.openNamespaces = 0
 	enc.reflectBuf = nil
 	enc.reflectEnc = nil
+	enc.fieldCount = 0
+	enc.depth = 0
+	enc.rejected = nil
+	enc.counting = false
 	_jsonPool.Put(enc)
 }
 
@@ -60,6 +64,21 @@ type jsonEncoder struct {
 	// for encoding generic values by reflection
 	reflectBuf *buffer.Buffer
 	reflectEnc ReflectedEncoder
+
+	// Per-encoder accounting for the optional EncoderConfig.MaxFields and
+	// MaxDepth limits. All of these are copied by clone, so counters
+	// accumulated by With (inherited fields and open namespaces) carry into
+	// every entry encoded from this encoder, while each EncodeEntry keeps
+	// its own independent copy.
+	//
+	// fieldCount is the number of business fields accumulated so far, depth
+	// is the current nesting depth, and rejected is set once a limit is
+	// exceeded. counting controls whether Add* calls count as business
+	// fields (it's off while entry metadata is encoded).
+	fieldCount int
+	depth      int
+	rejected   *FieldLimitError
+	counting   bool
 }
 
 // NewJSONEncoder creates a fast, low-allocation JSON encoder. The encoder
@@ -94,15 +113,25 @@ func newJSONEncoder(cfg EncoderConfig, spaced bool) *jsonEncoder {
 		EncoderConfig: &cfg,
 		buf:           bufferpool.Get(),
 		spaced:        spaced,
+		// Fields added directly to the encoder (e.g. inherited fields via
+		// Core.With) are business fields; EncodeEntry temporarily disables
+		// counting while it writes entry metadata.
+		counting: true,
 	}
 }
 
 func (enc *jsonEncoder) AddArray(key string, arr ArrayMarshaler) error {
+	if enc.rejected != nil {
+		return enc.rejected
+	}
 	enc.addKey(key)
 	return enc.AppendArray(arr)
 }
 
 func (enc *jsonEncoder) AddObject(key string, obj ObjectMarshaler) error {
+	if enc.rejected != nil {
+		return enc.rejected
+	}
 	enc.addKey(key)
 	return enc.AppendObject(obj)
 }
@@ -177,19 +206,37 @@ func (enc *jsonEncoder) encodeReflected(obj interface{}) ([]byte, error) {
 }
 
 func (enc *jsonEncoder) AddReflected(key string, obj interface{}) error {
+	if enc.rejected != nil {
+		return enc.rejected
+	}
 	valueBytes, err := enc.encodeReflected(obj)
 	if err != nil {
 		return err
 	}
 	enc.addKey(key)
+	if enc.rejected != nil {
+		return enc.rejected
+	}
+	// The reflected value has already been serialized once; scanning the
+	// resulting bytes folds its members and nesting depth into the counters
+	// without reflecting over the value a second time.
+	if enc.counting && enc.limitsOn() && !enc.accountReflected(valueBytes, key) {
+		return enc.rejected
+	}
 	_, err = enc.buf.Write(valueBytes)
 	return err
 }
 
 func (enc *jsonEncoder) OpenNamespace(key string) {
+	if enc.rejected != nil {
+		return
+	}
 	enc.addKey(key)
 	enc.buf.AppendByte('{')
 	enc.openNamespaces++
+	if enc.limitsOn() {
+		enc.enterContainer()
+	}
 }
 
 func (enc *jsonEncoder) AddString(key, val string) {
@@ -208,24 +255,58 @@ func (enc *jsonEncoder) AddUint64(key string, val uint64) {
 }
 
 func (enc *jsonEncoder) AppendArray(arr ArrayMarshaler) error {
+	if enc.rejected != nil {
+		return enc.rejected
+	}
 	enc.addElementSeparator()
 	enc.buf.AppendByte('[')
-	err := arr.MarshalLogArray(enc)
+	var err error
+	allowed := true
+	if enc.limitsOn() {
+		allowed = enc.enterContainer()
+	}
+	// Don't expand the array when the depth limit is already exceeded.
+	if allowed {
+		err = arr.MarshalLogArray(enc)
+	}
+	if enc.limitsOn() {
+		enc.leaveContainer()
+	}
 	enc.buf.AppendByte(']')
+	if enc.rejected != nil {
+		return enc.rejected
+	}
 	return err
 }
 
 func (enc *jsonEncoder) AppendObject(obj ObjectMarshaler) error {
+	if enc.rejected != nil {
+		return enc.rejected
+	}
 	// Close ONLY new openNamespaces that are created during
 	// AppendObject().
 	old := enc.openNamespaces
 	enc.openNamespaces = 0
 	enc.addElementSeparator()
 	enc.buf.AppendByte('{')
-	err := obj.MarshalLogObject(enc)
-	enc.buf.AppendByte('}')
+	var err error
+	allowed := true
+	if enc.limitsOn() {
+		allowed = enc.enterContainer()
+	}
+	// Don't expand the object when the depth limit is already exceeded.
+	if allowed {
+		err = obj.MarshalLogObject(enc)
+	}
 	enc.closeOpenNamespaces()
+	if enc.limitsOn() {
+		enc.leaveContainer()
+	}
+	enc.buf.AppendByte('}')
 	enc.openNamespaces = old
+	if enc.rejected != nil {
+		return enc.rejected
+	}
 	return err
 }
 
@@ -280,9 +361,15 @@ func (enc *jsonEncoder) AppendInt64(val int64) {
 }
 
 func (enc *jsonEncoder) AppendReflected(val interface{}) error {
+	if enc.rejected != nil {
+		return enc.rejected
+	}
 	valueBytes, err := enc.encodeReflected(val)
 	if err != nil {
 		return err
+	}
+	if enc.counting && enc.limitsOn() && !enc.accountReflected(valueBytes, "") {
+		return enc.rejected
 	}
 	enc.addElementSeparator()
 	_, err = enc.buf.Write(valueBytes)
@@ -355,11 +442,23 @@ func (enc *jsonEncoder) clone() *jsonEncoder {
 	clone.spaced = enc.spaced
 	clone.openNamespaces = enc.openNamespaces
 	clone.buf = bufferpool.Get()
+	clone.fieldCount = enc.fieldCount
+	clone.depth = enc.depth
+	clone.rejected = enc.rejected
+	clone.counting = enc.counting
 	return clone
 }
 
 func (enc *jsonEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer, error) {
 	final := enc.clone()
+	// Entry metadata (level, time, name, caller, message, stacktrace) is not
+	// counted as business fields; counting is re-enabled around addFields.
+	final.counting = false
+	// Inherited fields accumulated via Core.With may already exceed the
+	// limits; reject the entry before anything is written.
+	if final.baselineRejected() {
+		return final.dropEntry(ent)
+	}
 	final.buf.AppendByte('{')
 
 	if final.LevelKey != "" && final.EncodeLevel != nil {
@@ -417,13 +516,19 @@ func (enc *jsonEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer, 
 		final.addElementSeparator()
 		final.buf.Write(enc.buf.Bytes())
 	}
+	final.counting = true
 	addFields(final, fields)
+	final.counting = false
 	final.closeOpenNamespaces()
 	if ent.Stack != "" && final.StacktraceKey != "" {
 		final.AddString(final.StacktraceKey, ent.Stack)
 	}
 	final.buf.AppendByte('}')
 	final.buf.AppendString(final.LineEnding)
+
+	if final.rejected != nil {
+		return final.dropEntry(ent)
+	}
 
 	ret := final.buf
 	putJSONEncoder(final)
@@ -435,13 +540,27 @@ func (enc *jsonEncoder) truncate() {
 }
 
 func (enc *jsonEncoder) closeOpenNamespaces() {
-	for i := 0; i < enc.openNamespaces; i++ {
+	open := enc.openNamespaces
+	for i := 0; i < open; i++ {
 		enc.buf.AppendByte('}')
 	}
 	enc.openNamespaces = 0
+	if open > 0 && enc.limitsOn() {
+		enc.depth -= open
+	}
 }
 
 func (enc *jsonEncoder) addKey(key string) {
+	if enc.rejected != nil {
+		return
+	}
+	if enc.counting && enc.limitsOn() {
+		enc.fieldCount++
+		if enc.MaxFields > 0 && enc.fieldCount > enc.MaxFields {
+			enc.reject(FieldLimitFieldsExceeded, key)
+			return
+		}
+	}
 	enc.addElementSeparator()
 	enc.buf.AppendByte('"')
 	enc.safeAddString(key)
@@ -450,6 +569,110 @@ func (enc *jsonEncoder) addKey(key string) {
 	if enc.spaced {
 		enc.buf.AppendByte(' ')
 	}
+}
+
+// limitsOn reports whether any per-entry field limit is configured.
+func (enc *jsonEncoder) limitsOn() bool {
+	return enc.EncoderConfig != nil && (enc.MaxFields > 0 || enc.MaxDepth > 0)
+}
+
+// fieldLimitReached implements the optional fieldLimitTracker interface
+// checked by addFields, so that field expansion stops as soon as a limit is
+// exceeded.
+func (enc *jsonEncoder) fieldLimitReached() bool {
+	return enc.rejected != nil
+}
+
+// reject records the first limit error encountered while encoding.
+func (enc *jsonEncoder) reject(reason FieldLimitReason, key string) {
+	if enc.rejected != nil {
+		return
+	}
+	limit := enc.MaxFields
+	if reason == FieldLimitDepthExceeded {
+		limit = enc.MaxDepth
+	}
+	enc.rejected = &FieldLimitError{
+		Reason: reason,
+		Limit:  limit,
+		Fields: enc.fieldCount,
+		Depth:  enc.depth,
+		Key:    key,
+	}
+}
+
+// enterContainer increments the nesting depth when entering an object, array,
+// or namespace. It returns false when MaxDepth is exceeded, in which case the
+// caller must not expand the container's contents.
+func (enc *jsonEncoder) enterContainer() bool {
+	enc.depth++
+	if enc.MaxDepth > 0 && enc.depth > enc.MaxDepth {
+		enc.reject(FieldLimitDepthExceeded, "")
+		return false
+	}
+	return true
+}
+
+// leaveContainer decrements the nesting depth after a container is closed.
+func (enc *jsonEncoder) leaveContainer() {
+	enc.depth--
+}
+
+// accountReflected folds the members and nesting depth found in an already
+// serialized reflected JSON value into the running counters. It returns false
+// (and marks the entry rejected) when a limit is exceeded.
+func (enc *jsonEncoder) accountReflected(data []byte, key string) bool {
+	members, maxDepth := scanJSONFieldUsage(data)
+	if members > 0 {
+		enc.fieldCount += members
+		if enc.MaxFields > 0 && enc.fieldCount > enc.MaxFields {
+			enc.reject(FieldLimitFieldsExceeded, key)
+			return false
+		}
+	}
+	if maxDepth > 0 && enc.MaxDepth > 0 && enc.depth+maxDepth > enc.MaxDepth {
+		enc.reject(FieldLimitDepthExceeded, key)
+		return false
+	}
+	return true
+}
+
+// baselineRejected checks whether inherited context (encoded into this
+// encoder via Core.With) already exceeds the limits.
+func (enc *jsonEncoder) baselineRejected() bool {
+	if enc.rejected != nil {
+		return true
+	}
+	if !enc.limitsOn() {
+		return false
+	}
+	if enc.MaxFields > 0 && enc.fieldCount > enc.MaxFields {
+		enc.reject(FieldLimitFieldsExceeded, "")
+		return true
+	}
+	if enc.MaxDepth > 0 && enc.depth > enc.MaxDepth {
+		enc.reject(FieldLimitDepthExceeded, "")
+		return true
+	}
+	return false
+}
+
+// reportFieldLimit invokes the configured OnFieldLimit callback for a
+// rejected entry.
+func (enc *jsonEncoder) reportFieldLimit(ent Entry) {
+	if enc.OnFieldLimit != nil && enc.rejected != nil {
+		enc.OnFieldLimit(ent, *enc.rejected)
+	}
+}
+
+// dropEntry discards the partially encoded entry, invokes the configured
+// OnFieldLimit callback, and returns the rejection error.
+func (enc *jsonEncoder) dropEntry(ent Entry) (*buffer.Buffer, error) {
+	err := enc.rejected
+	enc.buf.Free()
+	enc.reportFieldLimit(ent)
+	putJSONEncoder(enc)
+	return nil, err
 }
 
 func (enc *jsonEncoder) addElementSeparator() {

@@ -205,8 +205,22 @@ func (f Field) Equals(other Field) bool {
 	}
 }
 
+// fieldLimitTracker is implemented by encoders that can reject fields
+// because a configured per-entry limit was exceeded. addFields uses it to
+// stop expanding subsequent fields (and therefore to avoid evaluating their
+// values) as soon as an entry is rejected.
+type fieldLimitTracker interface {
+	fieldLimitReached() bool
+}
+
 func addFields(enc ObjectEncoder, fields []Field) {
+	tracker, _ := enc.(fieldLimitTracker)
 	for i := range fields {
+		if tracker != nil && tracker.fieldLimitReached() {
+			// Skip the remaining fields entirely, so lazy values such as
+			// Stringer.String or error.Error are never evaluated.
+			return
+		}
 		fields[i].AddTo(enc)
 	}
 }

@@ -116,7 +116,10 @@ func (c consoleEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer, 
 	}
 
 	// Add any structured context.
-	c.writeContext(line, fields)
+	if err := c.writeContext(ent, line, fields); err != nil {
+		line.Free()
+		return nil, err
+	}
 
 	// If there's no stacktrace key, honor that; this allows users to force
 	// single-line output.
@@ -129,7 +132,7 @@ func (c consoleEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer, 
 	return line, nil
 }
 
-func (c consoleEncoder) writeContext(line *buffer.Buffer, extra []Field) {
+func (c consoleEncoder) writeContext(ent Entry, line *buffer.Buffer, extra []Field) error {
 	context := c.jsonEncoder.Clone().(*jsonEncoder)
 	defer func() {
 		// putJSONEncoder assumes the buffer is still used, but we write out the buffer so
@@ -138,16 +141,29 @@ func (c consoleEncoder) writeContext(line *buffer.Buffer, extra []Field) {
 		putJSONEncoder(context)
 	}()
 
+	// Inherited context accumulated via Core.With may already exceed the
+	// limits.
+	if context.baselineRejected() {
+		context.reportFieldLimit(ent)
+		return context.rejected
+	}
+
 	addFields(context, extra)
 	context.closeOpenNamespaces()
+	if context.rejected != nil {
+		// Drop the whole entry; nothing of the structured context is written.
+		context.reportFieldLimit(ent)
+		return context.rejected
+	}
 	if context.buf.Len() == 0 {
-		return
+		return nil
 	}
 
 	c.addSeparatorIfNecessary(line)
 	line.AppendByte('{')
 	line.Write(context.buf.Bytes())
 	line.AppendByte('}')
+	return nil
 }
 
 func (c consoleEncoder) addSeparatorIfNecessary(line *buffer.Buffer) {
