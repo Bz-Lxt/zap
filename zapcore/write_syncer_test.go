@@ -22,9 +22,11 @@ package zapcore
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -133,4 +135,109 @@ func TestMultiWriteSyncerSync_AllCalled(t *testing.T) {
 	assert.Error(t, ws.Sync(), "Expected first sink to fail")
 	assert.True(t, failed.Called(), "Expected first sink to have Sync method called.")
 	assert.True(t, second.Called(), "Expected call to Sync even with first failure.")
+}
+
+func drainAs(t *testing.T, ws WriteSyncer) DrainingWriteSyncer {
+	t.Helper()
+	d, ok := ws.(DrainingWriteSyncer)
+	require.True(t, ok, "expected %T to support Drain", ws)
+	return d
+}
+
+func waitForSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(ztest.Timeout(5 * time.Second)):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+func TestMultiWriteSyncerDrain(t *testing.T) {
+	t.Run("drains all syncers", func(t *testing.T) {
+		first, second := &ztest.Buffer{}, &ztest.Buffer{}
+		ws := drainAs(t, NewMultiWriteSyncer(first, second))
+
+		assert.NoError(t, ws.Drain(context.Background()))
+		assert.True(t, first.Called(), "expected first Sync to run")
+		assert.True(t, second.Called(), "expected second Sync to run")
+	})
+
+	t.Run("combines errors from all syncers", func(t *testing.T) {
+		first := &ztest.Buffer{}
+		first.SetError(errors.New("first failed"))
+		second := &ztest.Buffer{}
+		second.SetError(errors.New("second failed"))
+		ws := drainAs(t, NewMultiWriteSyncer(first, second))
+
+		err := ws.Drain(context.Background())
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "first failed")
+		assert.Contains(t, err.Error(), "second failed")
+	})
+
+	t.Run("drains outputs in parallel and resumes after timeout", func(t *testing.T) {
+		first := newGateWriteSyncer(false, true)
+		second := newGateWriteSyncer(false, true)
+		t.Cleanup(func() {
+			first.releaseSyncs()
+			second.releaseSyncs()
+		})
+		ws := drainAs(t, NewMultiWriteSyncer(first, second))
+
+		ctx, cancel := context.WithTimeout(
+			context.Background(), ztest.Timeout(30*time.Millisecond))
+		defer cancel()
+		require.ErrorIs(t, ws.Drain(ctx), context.DeadlineExceeded)
+
+		// With a sequential implementation the second Sync would never be
+		// reached while the first is blocked.
+		waitForSignal(t, first.syncEnter, "first sync")
+		waitForSignal(t, second.syncEnter, "second sync")
+
+		// The timed-out drain completes in the background once released; a
+		// follow-up drain succeeds.
+		first.releaseSyncs()
+		second.releaseSyncs()
+		require.NoError(t, ws.Drain(context.Background()))
+
+		first.mu.Lock()
+		assert.GreaterOrEqual(t, first.syncs, 1)
+		first.mu.Unlock()
+		second.mu.Lock()
+		assert.GreaterOrEqual(t, second.syncs, 1)
+		second.mu.Unlock()
+	})
+
+	t.Run("canceled context skips all syncers", func(t *testing.T) {
+		first, second := &ztest.Buffer{}, &ztest.Buffer{}
+		ws := drainAs(t, NewMultiWriteSyncer(first, second))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		require.ErrorIs(t, ws.Drain(ctx), context.Canceled)
+		assert.False(t, first.Called(), "no sync should run on a pre-canceled drain")
+		assert.False(t, second.Called())
+	})
+}
+
+func TestLockedWriteSyncerDrain(t *testing.T) {
+	t.Run("drains unlocked syncer", func(t *testing.T) {
+		ws := drainAs(t, Lock(&ztest.Discarder{}))
+		assert.NoError(t, ws.Drain(context.Background()))
+	})
+
+	t.Run("honors deadline and resumes", func(t *testing.T) {
+		g := newGateWriteSyncer(false, true)
+		t.Cleanup(g.releaseSyncs)
+		ws := drainAs(t, Lock(g))
+
+		ctx, cancel := context.WithTimeout(
+			context.Background(), ztest.Timeout(30*time.Millisecond))
+		defer cancel()
+		require.ErrorIs(t, ws.Drain(ctx), context.DeadlineExceeded)
+
+		g.releaseSyncs()
+		assert.NoError(t, ws.Drain(context.Background()))
+	})
 }

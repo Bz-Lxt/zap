@@ -21,6 +21,7 @@
 package zapcore
 
 import (
+	"context"
 	"io"
 	"sync"
 
@@ -32,6 +33,45 @@ import (
 type WriteSyncer interface {
 	io.Writer
 	Sync() error
+}
+
+// A DrainingWriteSyncer is a WriteSyncer that can flush any buffered data
+// within a caller-specified deadline.
+//
+// Drain is intended for graceful shutdown: it flushes data already accepted
+// by the WriteSyncer, returning early when ctx is canceled. A write or sync
+// already in flight cannot be interrupted mid-operation and may complete in
+// the background; calling Drain again with a new context resumes the work
+// that was not finished. Data accepted after a Drain call starts must not be
+// flushed by that call.
+type DrainingWriteSyncer interface {
+	WriteSyncer
+
+	// Drain flushes any buffered data, returning when all eligible data has
+	// been flushed, or when ctx is canceled.
+	Drain(ctx context.Context) error
+}
+
+// awaitCall invokes fn, returning ctx.Err() if ctx is canceled before fn
+// returns. In that case fn keeps running in the background.
+func awaitCall(ctx context.Context, fn func() error) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- fn()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // AddSync converts an io.Writer to a WriteSyncer. It attempts to be
@@ -73,6 +113,23 @@ func (s *lockedWriteSyncer) Sync() error {
 	err := s.ws.Sync()
 	s.Unlock()
 	return err
+}
+
+// Drain serializes the call with Write and Sync, delegating to the wrapped
+// WriteSyncer's Drain when it supports bounded draining. A plain Sync is
+// invoked with the deadline honored on the caller's side. If the deadline
+// expires while the call is still in flight, it completes in the background
+// while still holding the lock, so serialization with Write is preserved.
+func (s *lockedWriteSyncer) Drain(ctx context.Context) error {
+	return awaitCall(ctx, func() error {
+		s.Lock()
+		defer s.Unlock()
+
+		if d, ok := s.ws.(DrainingWriteSyncer); ok {
+			return d.Drain(ctx)
+		}
+		return s.ws.Sync()
+	})
 }
 
 type writerWrapper struct {
@@ -119,4 +176,58 @@ func (ws multiWriteSyncer) Sync() error {
 		err = multierr.Append(err, w.Sync())
 	}
 	return err
+}
+
+// Drain flushes every underlying WriteSyncer concurrently, rather than
+// sequentially like Sync. It returns when all of them have completed, or when
+// ctx is canceled; in the latter case any still-running drain completes in the
+// background, and a subsequent Drain resumes the unfinished work.
+//
+// All underlying WriteSyncers are called even if some of them fail, and their
+// errors are combined.
+func (ws multiWriteSyncer) Drain(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	var (
+		wg      sync.WaitGroup
+		errMu   sync.Mutex
+		syncErr error
+	)
+	for _, w := range ws {
+		wg.Add(1)
+		go func(w WriteSyncer) {
+			defer wg.Done()
+
+			var err error
+			if d, ok := w.(DrainingWriteSyncer); ok {
+				err = d.Drain(ctx)
+			} else {
+				err = w.Sync()
+			}
+			if err != nil {
+				errMu.Lock()
+				syncErr = multierr.Append(syncErr, err)
+				errMu.Unlock()
+			}
+		}(w)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return syncErr
+	case <-ctx.Done():
+		// syncErr must not be read here: child goroutines may still be
+		// appending to it. A subsequent Drain observes their results.
+		return ctx.Err()
+	}
 }

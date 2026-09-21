@@ -21,7 +21,8 @@
 package zapcore
 
 import (
-	"bufio"
+	"context"
+	"io"
 	"sync"
 	"time"
 
@@ -74,6 +75,11 @@ const (
 //	  FlushInterval: time.Minute,
 //	}
 //	defer ws.Stop()
+//
+// For graceful shutdown with a hard deadline, use Drain instead of Sync:
+// it flushes only the data that had been accepted before the call, honors
+// the context deadline, and can be called again to resume flushing whatever
+// a previous, timed-out call did not finish.
 type BufferedWriteSyncer struct {
 	// WS is the WriteSyncer around which BufferedWriteSyncer will buffer
 	// writes.
@@ -99,22 +105,33 @@ type BufferedWriteSyncer struct {
 	// Defaults to the system clock.
 	Clock Clock
 
-	// unexported fields for state
+	// mu protects the in-memory buffer state below. Critical sections only
+	// manipulate memory; physical writes are performed without mu held.
 	mu          sync.Mutex
 	initialized bool // whether initialize() has run
 	stopped     bool // whether Stop() has run
-	writer      *bufio.Writer
+	active      []byte
+	queued      [][]byte // sealed segments awaiting a physical write, FIFO
+	inflight    *inflightWrite
 	ticker      *time.Ticker
 	stop        chan struct{} // closed when flushLoop should stop
 	done        chan struct{} // closed when flushLoop has stopped
+
+	// flushMu serializes coordinators of physical writes (Drain, Sync, and
+	// the synchronous overflow flush in Write), so the wrapped WriteSyncer
+	// never receives concurrent Write calls.
+	flushMu sync.Mutex
+}
+
+// inflightWrite is a segment being written by a goroutine that may outlive
+// the Drain or Sync call that started it when a deadline was reached.
+type inflightWrite struct {
+	seg  []byte
+	done chan struct{}
+	err  error
 }
 
 func (s *BufferedWriteSyncer) initialize() {
-	size := s.Size
-	if size == 0 {
-		size = _defaultBufferSize
-	}
-
 	flushInterval := s.FlushInterval
 	if flushInterval == 0 {
 		flushInterval = _defaultFlushInterval
@@ -125,46 +142,265 @@ func (s *BufferedWriteSyncer) initialize() {
 	}
 
 	s.ticker = s.Clock.NewTicker(flushInterval)
-	s.writer = bufio.NewWriterSize(s.WS, size)
 	s.stop = make(chan struct{})
 	s.done = make(chan struct{})
 	s.initialized = true
 	go s.flushLoop()
 }
 
+func (s *BufferedWriteSyncer) bufferSize() int {
+	if s.Size > 0 {
+		return s.Size
+	}
+	return _defaultBufferSize
+}
+
 // Write writes log data into buffer syncer directly, multiple Write calls will be batched,
 // and log data will be flushed to disk when the buffer is full or periodically.
 func (s *BufferedWriteSyncer) Write(bs []byte) (int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if !s.initialized {
 		s.initialize()
 	}
 
-	// To avoid partial writes from being flushed, we manually flush the existing buffer if:
-	// * The current write doesn't fit into the buffer fully, and
-	// * The buffer is not empty (since bufio will not split large writes when the buffer is empty)
-	if len(bs) > s.writer.Available() && s.writer.Buffered() > 0 {
-		if err := s.writer.Flush(); err != nil {
-			return 0, err
-		}
+	size := s.bufferSize()
+
+	// To avoid partial writes from being flushed, seal the active segment if:
+	// * the current write doesn't fit into it, and
+	// * it is not empty (an oversized write on an empty active segment gets
+	//   its own segment instead).
+	sealed := false
+	if len(bs) > size-len(s.active) && len(s.active) > 0 {
+		s.queued = append(s.queued, s.active)
+		s.active = nil
+		sealed = true
 	}
 
-	return s.writer.Write(bs)
+	if len(bs) > size {
+		// The Write contract lets callers reuse bs, so copy an oversized
+		// write into its own segment rather than retaining the input.
+		seg := make([]byte, len(bs))
+		copy(seg, bs)
+		s.queued = append(s.queued, seg)
+		sealed = true
+	} else {
+		if cap(s.active) == 0 {
+			s.active = make([]byte, 0, size)
+		}
+		s.active = append(s.active, bs...)
+	}
+
+	if !sealed {
+		s.mu.Unlock()
+		return len(bs), nil
+	}
+
+	// Flush synchronously, preserving the historical overflow behavior:
+	// all currently queued segments become visible before Write returns.
+	pending := len(s.queued)
+	if s.inflight != nil {
+		pending++
+	}
+	s.mu.Unlock()
+
+	if err := s.driveSegments(context.Background(), pending); err != nil {
+		return 0, err
+	}
+	return len(bs), nil
 }
 
 // Sync flushes buffered log data into disk directly.
 func (s *BufferedWriteSyncer) Sync() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if !s.initialized {
+		s.mu.Unlock()
+		return s.WS.Sync()
+	}
+	pending := s.sealActiveLocked()
+	s.mu.Unlock()
 
-	var err error
-	if s.initialized {
-		err = s.writer.Flush()
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	err := s.drive(context.Background(), pending)
+	return multierr.Append(err, s.WS.Sync())
+}
+
+// Drain flushes the log data already accepted at the time of the call into
+// the wrapped WriteSyncer, honoring ctx as a hard deadline. It is intended for
+// graceful shutdown:
+//
+//   - Data written after Drain starts is not flushed by this call; those
+//     writes stay buffered and cross no drain boundary.
+//   - If the deadline expires while a write or sync to the wrapped
+//     WriteSyncer is in flight, Drain returns the context error while that
+//     operation completes in the background.
+//   - Calling Drain again (typically with a fresh context) resumes the
+//     unfinished work; already-flushed data is never written twice.
+//   - When the wrapped WriteSyncer is a multi-writer (or itself a
+//     DrainingWriteSyncer), underlying outputs are drained in parallel.
+//
+// Sync keeps its original, unbounded semantics and is unaffected.
+func (s *BufferedWriteSyncer) Drain(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
 
-	return multierr.Append(err, s.WS.Sync())
+	s.mu.Lock()
+	if !s.initialized {
+		s.mu.Unlock()
+		return s.syncUnderlying(ctx)
+	}
+	// Establish the drain boundary: seal the active segment. Everything
+	// appended to queued after this point is younger than this Drain.
+	pending := s.sealActiveLocked()
+	s.mu.Unlock()
+
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	err := s.drive(ctx, pending)
+	// If the deadline was reached, don't start another potentially blocking
+	// operation on the underlying writer; it will be covered by the next
+	// Drain.
+	if ctx.Err() == nil {
+		err = multierr.Append(err, s.syncUnderlying(ctx))
+	}
+	return err
+}
+
+// sealActiveLocked moves the active segment into the queue and returns the
+// number of segments that still need a physical write (the in-flight one, if
+// any, plus everything queued). Caller holds mu.
+func (s *BufferedWriteSyncer) sealActiveLocked() int {
+	if len(s.active) > 0 {
+		s.queued = append(s.queued, s.active)
+		s.active = nil
+	}
+	pending := len(s.queued)
+	if s.inflight != nil {
+		pending++
+	}
+	return pending
+}
+
+// syncUnderlying flushes/syncs the wrapped WriteSyncer, taking its parallel
+// drain capability into account and honoring the deadline on the caller's
+// side. Caller holds flushMu.
+func (s *BufferedWriteSyncer) syncUnderlying(ctx context.Context) error {
+	if d, ok := s.WS.(DrainingWriteSyncer); ok {
+		return d.Drain(ctx)
+	}
+	return awaitCall(ctx, s.WS.Sync)
+}
+
+// driveSegments runs a single drive pass under flushMu.
+func (s *BufferedWriteSyncer) driveSegments(ctx context.Context, pending int) error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	return s.drive(ctx, pending)
+}
+
+// drive writes pending queued segments, in order, to the wrapped WriteSyncer.
+// It waits for a segment left in flight by a previous timed-out call before
+// launching new ones, so timed-out calls can be resumed and no segment is
+// written twice. When ctx is canceled, it returns immediately; the in-flight
+// write keeps running in the background and a later call resumes here.
+//
+// Caller holds flushMu; mu is only taken for short bookkeeping sections.
+func (s *BufferedWriteSyncer) drive(ctx context.Context, pending int) error {
+	for pending > 0 {
+		s.mu.Lock()
+		if inf := s.inflight; inf != nil {
+			s.mu.Unlock()
+
+			select {
+			case <-inf.done:
+				pending--
+				if inf.err != nil {
+					// Any unwritten remainder was requeued by the writer.
+					return inf.err
+				}
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		if len(s.queued) == 0 {
+			s.mu.Unlock()
+			return nil
+		}
+
+		seg := s.queued[0]
+		s.queued = s.queued[1:]
+		inf := &inflightWrite{
+			seg:  seg,
+			done: make(chan struct{}),
+		}
+		s.inflight = inf
+		s.mu.Unlock()
+
+		s.startSegmentWrite(inf)
+
+		select {
+		case <-inf.done:
+			pending--
+			if inf.err != nil {
+				return inf.err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// startSegmentWrite writes a single segment in a detached goroutine so that a
+// blocked underlying writer cannot pin the Drain or Sync caller past its
+// deadline. On exit it clears the in-flight slot; if only part of the segment
+// was written, the unwritten remainder is requeued at the head for retry.
+func (s *BufferedWriteSyncer) startSegmentWrite(inf *inflightWrite) {
+	go func() {
+		n, err := writeAll(s.WS, inf.seg)
+
+		s.mu.Lock()
+		if n < len(inf.seg) {
+			rem := make([]byte, len(inf.seg)-n)
+			copy(rem, inf.seg[n:])
+			s.queued = append([][]byte{rem}, s.queued...)
+		}
+		inf.err = err
+		if s.inflight == inf {
+			s.inflight = nil
+		}
+		s.mu.Unlock()
+
+		close(inf.done)
+	}()
+}
+
+// writeAll writes the full p to w, advancing through short writes.
+func writeAll(w io.Writer, p []byte) (int, error) {
+	total := 0
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n <= 0 || n > len(p) {
+			return total, io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return total, nil
 }
 
 // flushLoop flushes the buffer at the configured interval until Stop is
@@ -176,8 +412,8 @@ func (s *BufferedWriteSyncer) flushLoop() {
 		select {
 		case <-s.ticker.C:
 			// we just simply ignore error here
-			// because the underlying bufio writer stores any errors
-			// and we return any error from Sync() as part of the close
+			// because any write error is returned again by later Sync
+			// and Stop calls, e.g. as part of the close
 			_ = s.Sync()
 		case <-s.stop:
 			return
