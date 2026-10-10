@@ -28,14 +28,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"go.uber.org/zap/zapcore"
 )
 
 const schemeFile = "file"
 
-var _sinkRegistry = newSinkRegistry()
+// _extensions is the single registry that backs both encoder and sink
+// lookups, so grouped installations are visible atomically across both.
+var _extensions = newDefaultExtensionRegistry()
+
+// _sinkRegistry is the sink-facing facade over the shared extension registry.
+var _sinkRegistry = newSinkRegistryFrom(_extensions)
 
 // Sink defines the interface to write to and close logger destinations.
 type Sink interface {
@@ -55,17 +59,19 @@ type nopCloserSink struct{ zapcore.WriteSyncer }
 
 func (nopCloserSink) Close() error { return nil }
 
+// sinkRegistry is a thin sink-facing facade around the shared
+// extensionRegistry. Embedding promotes the registry's openFile field and
+// newSink/openSink methods.
 type sinkRegistry struct {
-	mu        sync.Mutex
-	factories map[string]func(*url.URL) (Sink, error)          // keyed by scheme
-	openFile  func(string, int, os.FileMode) (*os.File, error) // type matches os.OpenFile
+	*extensionRegistry
+}
+
+func newSinkRegistryFrom(r *extensionRegistry) *sinkRegistry {
+	return &sinkRegistry{r}
 }
 
 func newSinkRegistry() *sinkRegistry {
-	sr := &sinkRegistry{
-		factories: make(map[string]func(*url.URL) (Sink, error)),
-		openFile:  os.OpenFile,
-	}
+	sr := newSinkRegistryFrom(newExtensionRegistry())
 	// Infallible operation: the registry is empty, so we can't have a conflict.
 	_ = sr.RegisterSink(schemeFile, sr.newFileSinkFromURL)
 	return sr
@@ -73,30 +79,20 @@ func newSinkRegistry() *sinkRegistry {
 
 // RegisterSink registers the given factory for the specific scheme.
 func (sr *sinkRegistry) RegisterSink(scheme string, factory func(*url.URL) (Sink, error)) error {
-	sr.mu.Lock()
-	defer sr.mu.Unlock()
-
-	if scheme == "" {
-		return errors.New("can't register a sink factory for empty string")
-	}
-	normalized, err := normalizeScheme(scheme)
-	if err != nil {
-		return fmt.Errorf("%q is not a valid scheme: %v", scheme, err)
-	}
-	if _, ok := sr.factories[normalized]; ok {
-		return fmt.Errorf("sink factory already registered for scheme %q", normalized)
-	}
-	sr.factories[normalized] = factory
-	return nil
+	return sr.registerSink(scheme, factory)
 }
 
-func (sr *sinkRegistry) newSink(rawURL string) (Sink, error) {
+func (r *extensionRegistry) newSink(rawURL string) (Sink, error) {
+	return r.openSink(r.snapshot(), rawURL)
+}
+
+func (r *extensionRegistry) openSink(snap *extensionSet, rawURL string) (Sink, error) {
 	// URL parsing doesn't work well for Windows paths such as `c:\log.txt`, as scheme is set to
 	// the drive, and path is unset unless `c:/log.txt` is used.
 	// To avoid Windows-specific URL handling, we instead check IsAbs to open as a file.
 	// filepath.IsAbs is OS-specific, so IsAbs('c:/log.txt') is false outside of Windows.
 	if filepath.IsAbs(rawURL) {
-		return sr.newFileSinkFromPath(rawURL)
+		return r.newFileSinkFromPath(rawURL)
 	}
 
 	u, err := url.Parse(rawURL)
@@ -107,9 +103,7 @@ func (sr *sinkRegistry) newSink(rawURL string) (Sink, error) {
 		u.Scheme = schemeFile
 	}
 
-	sr.mu.Lock()
-	factory, ok := sr.factories[u.Scheme]
-	sr.mu.Unlock()
+	factory, ok := snap.sinks[u.Scheme]
 	if !ok {
 		return nil, &errSinkNotFound{u.Scheme}
 	}
@@ -123,11 +117,16 @@ func (sr *sinkRegistry) newSink(rawURL string) (Sink, error) {
 // (https://tools.ietf.org/html/rfc3983#section-3.1), and must not already
 // have a factory registered. Zap automatically registers a factory for the
 // "file" scheme.
+//
+// Registrations made through this function are permanent: they remain
+// available until the process exits and cannot be revoked. For revocable,
+// grouped registration of sink factories together with encoders, use
+// [ExtensionScope].
 func RegisterSink(scheme string, factory func(*url.URL) (Sink, error)) error {
 	return _sinkRegistry.RegisterSink(scheme, factory)
 }
 
-func (sr *sinkRegistry) newFileSinkFromURL(u *url.URL) (Sink, error) {
+func (r *extensionRegistry) newFileSinkFromURL(u *url.URL) (Sink, error) {
 	if u.User != nil {
 		return nil, fmt.Errorf("user and password not allowed with file URLs: got %v", u)
 	}
@@ -145,17 +144,17 @@ func (sr *sinkRegistry) newFileSinkFromURL(u *url.URL) (Sink, error) {
 		return nil, fmt.Errorf("file URLs must leave host empty or use localhost: got %v", u)
 	}
 
-	return sr.newFileSinkFromPath(u.Path)
+	return r.newFileSinkFromPath(u.Path)
 }
 
-func (sr *sinkRegistry) newFileSinkFromPath(path string) (Sink, error) {
+func (r *extensionRegistry) newFileSinkFromPath(path string) (Sink, error) {
 	switch path {
 	case "stdout":
 		return nopCloserSink{os.Stdout}, nil
 	case "stderr":
 		return nopCloserSink{os.Stderr}, nil
 	}
-	return sr.openFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o666)
+	return r.openFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o666)
 }
 
 func normalizeScheme(s string) (string, error) {

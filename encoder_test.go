@@ -70,16 +70,17 @@ func TestNewEncoderNoName(t *testing.T) {
 }
 
 func testEncoders(f func()) {
-	existing := _encoderNameToConstructor
-	_encoderNameToConstructor = make(map[string]func(zapcore.EncoderConfig) (zapcore.Encoder, error))
-	defer func() { _encoderNameToConstructor = existing }()
+	existing := _extensions
+	_extensions = newExtensionRegistry()
+	defer func() { _extensions = existing }()
 	f()
 }
 
 func testEncodersRegistered(t *testing.T, names ...string) {
-	assert.Len(t, _encoderNameToConstructor, len(names), "the expected number of registered encoders does not match the actual number")
+	encoders := _extensions.snapshot().encoders
+	assert.Len(t, encoders, len(names), "the expected number of registered encoders does not match the actual number")
 	for _, name := range names {
-		assert.NotNil(t, _encoderNameToConstructor[name], "no encoder is registered for name %s", name)
+		assert.NotNil(t, encoders[name], "no encoder is registered for name %s", name)
 	}
 }
 

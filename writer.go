@@ -48,7 +48,7 @@ import (
 // os.Stdout and os.Stderr. When specified without a scheme, relative file
 // paths also work.
 func Open(paths ...string) (zapcore.WriteSyncer, func(), error) {
-	writers, closeAll, err := open(paths)
+	writers, closeAll, err := _sinkRegistry.open(paths)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -57,7 +57,13 @@ func Open(paths ...string) (zapcore.WriteSyncer, func(), error) {
 	return writer, closeAll, nil
 }
 
-func open(paths []string) ([]zapcore.WriteSyncer, func(), error) {
+func (r *extensionRegistry) open(paths []string) ([]zapcore.WriteSyncer, func(), error) {
+	// A single snapshot backs every path, so one Open call observes one
+	// complete registry version.
+	return r.openWith(r.snapshot(), paths)
+}
+
+func (r *extensionRegistry) openWith(snap *extensionSet, paths []string) ([]zapcore.WriteSyncer, func(), error) {
 	writers := make([]zapcore.WriteSyncer, 0, len(paths))
 	closers := make([]io.Closer, 0, len(paths))
 	closeAll := func() {
@@ -68,7 +74,7 @@ func open(paths []string) ([]zapcore.WriteSyncer, func(), error) {
 
 	var openErr error
 	for _, path := range paths {
-		sink, err := _sinkRegistry.newSink(path)
+		sink, err := r.openSink(snap, path)
 		if err != nil {
 			openErr = multierr.Append(openErr, fmt.Errorf("open sink %q: %w", path, err))
 			continue

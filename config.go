@@ -237,12 +237,17 @@ func NewDevelopmentConfig() Config {
 
 // Build constructs a logger from the Config and Options.
 func (cfg Config) Build(opts ...Option) (*Logger, error) {
-	enc, err := cfg.buildEncoder()
+	// One snapshot backs the encoder and every sink lookup, so a build
+	// concurrent with a grouped installation observes a single complete
+	// registry version: either the whole group or none of it.
+	snap := _extensions.snapshot()
+
+	enc, err := snap.newEncoder(cfg.Encoding, cfg.EncoderConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	sink, errSink, err := cfg.openSinks()
+	sink, errSink, err := cfg.openSinks(snap)
 	if err != nil {
 		return nil, err
 	}
@@ -312,19 +317,15 @@ func (cfg Config) buildOptions(errSink zapcore.WriteSyncer) []Option {
 	return opts
 }
 
-func (cfg Config) openSinks() (zapcore.WriteSyncer, zapcore.WriteSyncer, error) {
-	sink, closeOut, err := Open(cfg.OutputPaths...)
+func (cfg Config) openSinks(snap *extensionSet) (zapcore.WriteSyncer, zapcore.WriteSyncer, error) {
+	writers, closeOut, err := _extensions.openWith(snap, cfg.OutputPaths)
 	if err != nil {
 		return nil, nil, err
 	}
-	errSink, _, err := Open(cfg.ErrorOutputPaths...)
+	errWriters, _, err := _extensions.openWith(snap, cfg.ErrorOutputPaths)
 	if err != nil {
 		closeOut()
 		return nil, nil, err
 	}
-	return sink, errSink, nil
-}
-
-func (cfg Config) buildEncoder() (zapcore.Encoder, error) {
-	return newEncoder(cfg.Encoding, cfg.EncoderConfig)
+	return CombineWriteSyncers(writers...), CombineWriteSyncers(errWriters...), nil
 }
