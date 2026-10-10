@@ -33,9 +33,10 @@ import (
 )
 
 var _cePool = pool.New(func() *CheckedEntry {
-	// Pre-allocate some space for cores.
+	// Pre-allocate some space for cores and fan-out branches.
 	return &CheckedEntry{
-		cores: make([]Core, 4),
+		cores:    make([]Core, 4),
+		branches: make([]coreBranch, 4),
 	}
 })
 
@@ -209,12 +210,57 @@ var _ CheckWriteHook = CheckWriteAction(0)
 // method is called. They may modify the Entry and Fields freely.
 type CheckPreWriteHook func(Entry, []Field) (Entry, []Field)
 
+// WriteStatus describes the outcome of delivering an Entry to a single
+// fan-out branch, i.e. one of the Cores offered the Entry during Check.
+type WriteStatus uint8
+
+const (
+	// WriteNotSelected means the branch was declared during Check but did
+	// not select the Entry, so its Write method was not called.
+	WriteNotSelected WriteStatus = iota
+	// WriteSucceeded means the branch selected the Entry and its Write
+	// method returned no error.
+	WriteSucceeded
+	// WriteFailed means the branch selected the Entry but its Write method
+	// returned an error.
+	WriteFailed
+)
+
+// WriteResult reports the delivery result of a single declared fan-out
+// branch.
+type WriteResult struct {
+	// Core is the branch that this result describes.
+	Core Core
+	// Status is the delivery status of the branch.
+	Status WriteStatus
+	// Err holds the error returned by the branch when Status is WriteFailed.
+	// It is nil otherwise.
+	Err error
+}
+
+// CheckPostWriteHook is a callback invoked after an Entry has been delivered
+// to the Cores that selected it during Check. Register one on a CheckedEntry
+// with the AfterWrite method.
+//
+// The hook receives the Entry and fields that were written and the delivery
+// result of every declared branch in branch declaration order: branches that
+// selected the Entry report WriteSucceeded or WriteFailed, and branches that
+// did not select it report WriteNotSelected. A failure on one branch never
+// masks the results of the other branches.
+//
+// Hooks run in the order they were added, before any terminal CheckWriteHook
+// registered with After. An error returned by the hook is written to the
+// CheckedEntry's ErrorOutput and does not keep subsequent hooks or the
+// terminal action from running. The hook may safely log again.
+type CheckPostWriteHook func(Entry, []Field, []WriteResult) error
+
 // CheckedEntry is an Entry together with a collection of Cores that have
 // already agreed to log it.
 //
-// CheckedEntry references should be created by calling AddCore or After on a
-// nil *CheckedEntry. References are returned to a pool after Write, and MUST
-// NOT be retained after calling their Write method.
+// CheckedEntry references should be created by calling AddCore, DeclareCore,
+// Before, AfterWrite, or After on a nil *CheckedEntry. References are
+// returned to a pool after Write, and MUST NOT be retained after calling
+// their Write method.
 type CheckedEntry struct {
 	Entry
 	ErrorOutput WriteSyncer
@@ -222,6 +268,19 @@ type CheckedEntry struct {
 	after       CheckWriteHook
 	cores       []Core
 	before      []CheckPreWriteHook
+	afterWrite  []CheckPostWriteHook
+	branches    []coreBranch
+	openBranch  int // index of the most recently declared open branch, or -1
+}
+
+// coreBranch records a fan-out branch declared during Check and the range of
+// entries it caused to be added to the cores slice. An empty range means the
+// branch did not select the Entry.
+type coreBranch struct {
+	core   Core
+	start  int
+	end    int
+	parent int // index of the enclosing open branch, or -1
 }
 
 func (ce *CheckedEntry) reset() {
@@ -238,6 +297,15 @@ func (ce *CheckedEntry) reset() {
 		ce.before[i] = nil
 	}
 	ce.before = ce.before[:0]
+	for i := range ce.afterWrite {
+		ce.afterWrite[i] = nil
+	}
+	ce.afterWrite = ce.afterWrite[:0]
+	for i := range ce.branches {
+		ce.branches[i].core = nil
+	}
+	ce.branches = ce.branches[:0]
+	ce.openBranch = -1
 }
 
 // Write writes the entry to the stored Cores, returns any errors, and returns
@@ -265,15 +333,30 @@ func (ce *CheckedEntry) Write(fields ...Field) {
 		return
 	}
 	ce.dirty = true
+	// Return the entry to the pool no matter how Write unwinds: a hook may
+	// return an error, log again, panic, or terminate the goroutine.
+	defer putCheckedEntry(ce)
 
 	ent := ce.Entry
 	for i := range ce.before {
 		ent, fields = ce.before[i](ent, fields)
 	}
 
+	// Deliver to every selected branch and record each result separately, so
+	// a failure on one branch does not mask the results of the others. The
+	// per-core errors are only collected when a post-write hook will observe
+	// them, to keep the common hook-free path allocation-free.
 	var err error
+	var writeErrs []error
+	if len(ce.afterWrite) > 0 {
+		writeErrs = make([]error, len(ce.cores))
+	}
 	for i := range ce.cores {
-		err = multierr.Append(err, ce.cores[i].Write(ent, fields))
+		writeErr := ce.cores[i].Write(ent, fields)
+		if writeErrs != nil {
+			writeErrs[i] = writeErr
+		}
+		err = multierr.Append(err, writeErr)
 	}
 	if err != nil && ce.ErrorOutput != nil {
 		_, _ = fmt.Fprintf(
@@ -285,11 +368,69 @@ func (ce *CheckedEntry) Write(fields ...Field) {
 		_ = ce.ErrorOutput.Sync() // ignore error
 	}
 
+	// Post-write hooks observe the real per-branch delivery results in
+	// branch declaration order, including branches that did not select the
+	// entry. Hook errors are reported but do not stop the wrap-up.
+	if len(ce.afterWrite) > 0 {
+		var results []WriteResult
+		if len(ce.branches) > 0 {
+			results = make([]WriteResult, len(ce.branches))
+			for i := range ce.branches {
+				results[i] = ce.branches[i].result(writeErrs)
+			}
+		} else {
+			// Cores registered outside of a DeclareCore/CloseCore walk are
+			// each their own selected branch.
+			results = make([]WriteResult, len(ce.cores))
+			for i := range ce.cores {
+				r := WriteResult{Core: ce.cores[i], Err: writeErrs[i]}
+				if writeErrs[i] == nil {
+					r.Status = WriteSucceeded
+				} else {
+					r.Status = WriteFailed
+				}
+				results[i] = r
+			}
+		}
+		for i := range ce.afterWrite {
+			if hookErr := ce.afterWrite[i](ent, fields, results); hookErr != nil && ce.ErrorOutput != nil {
+				_, _ = fmt.Fprintf(
+					ce.ErrorOutput,
+					"%v post-write hook error: %v\n",
+					ce.Time,
+					hookErr,
+				)
+				_ = ce.ErrorOutput.Sync() // ignore error
+			}
+		}
+	}
+
+	// Terminal behavior runs last, after all post-write processing.
 	hook := ce.after
 	if hook != nil {
 		hook.OnWrite(ce, fields)
 	}
-	putCheckedEntry(ce)
+}
+
+// result builds the WriteResult for a declared branch from the per-core
+// errors collected during Write.
+func (b coreBranch) result(writeErrs []error) WriteResult {
+	r := WriteResult{Core: b.core}
+	if b.end <= b.start {
+		r.Status = WriteNotSelected
+		return r
+	}
+	var err error
+	for i := b.start; i < b.end; i++ {
+		err = multierr.Append(err, writeErrs[i])
+	}
+	r.Err = err
+	if err == nil {
+		r.Status = WriteSucceeded
+	} else {
+		r.Status = WriteFailed
+	}
+	return r
 }
 
 // AddCore adds a Core that has agreed to log this CheckedEntry. It's intended to be
@@ -301,6 +442,45 @@ func (ce *CheckedEntry) AddCore(ent Entry, core Core) *CheckedEntry {
 		ce.Entry = ent
 	}
 	ce.cores = append(ce.cores, core)
+	return ce
+}
+
+// DeclareCore reports that the given fan-out branch Core is about to be
+// offered the Entry during a Check walk. It is intended for fan-out Core
+// implementations, such as the Core returned by NewTee. Each call must be
+// followed by the branch's Check call and a matching CloseCore call:
+//
+//	ce = ce.DeclareCore(ent, branch)
+//	ce = branch.Check(ent, ce)
+//	ce = ce.CloseCore()
+//
+// A branch whose Check adds no Cores is reported with WriteNotSelected to
+// post-write hooks. It is safe to call on nil CheckedEntry references.
+func (ce *CheckedEntry) DeclareCore(ent Entry, core Core) *CheckedEntry {
+	if ce == nil {
+		ce = getCheckedEntry()
+		ce.Entry = ent
+	}
+	ce.branches = append(ce.branches, coreBranch{
+		core:   core,
+		start:  len(ce.cores),
+		parent: ce.openBranch,
+	})
+	ce.openBranch = len(ce.branches) - 1
+	return ce
+}
+
+// CloseCore finishes the most recently declared branch that is still open,
+// after that branch's Check call has returned. Like AddCore, it is intended
+// for fan-out Core implementations and is safe to call on nil CheckedEntry
+// references.
+func (ce *CheckedEntry) CloseCore() *CheckedEntry {
+	i := ce.openBranch
+	if i < 0 {
+		return ce
+	}
+	ce.branches[i].end = len(ce.cores)
+	ce.openBranch = ce.branches[i].parent
 	return ce
 }
 
@@ -322,6 +502,20 @@ func (ce *CheckedEntry) Before(ent Entry, hook CheckPreWriteHook) *CheckedEntry 
 		ce.Entry = ent
 	}
 	ce.before = append(ce.before, hook)
+	return ce
+}
+
+// AfterWrite adds a post-write hook that is invoked after the Entry is
+// delivered to the Cores that selected it. The hook sees every declared
+// branch's delivery result in declaration order. Multiple hooks run in the
+// order they were added, and all of them run before the terminal hook set
+// with After. It's safe to call this on nil CheckedEntry references.
+func (ce *CheckedEntry) AfterWrite(ent Entry, hook CheckPostWriteHook) *CheckedEntry {
+	if ce == nil {
+		ce = getCheckedEntry()
+		ce.Entry = ent
+	}
+	ce.afterWrite = append(ce.afterWrite, hook)
 	return ce
 }
 

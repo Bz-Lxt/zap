@@ -73,8 +73,23 @@ func (mc multiCore) Enabled(lvl Level) bool {
 }
 
 func (mc multiCore) Check(ent Entry, ce *CheckedEntry) *CheckedEntry {
+	in := ce
 	for i := range mc {
+		// Declare every branch up front so post-write hooks also see
+		// branches that do not select the entry, in declaration order.
+		ce = ce.DeclareCore(ent, mc[i])
 		ce = mc[i].Check(ent, ce)
+		ce = ce.CloseCore()
+	}
+	if in == nil && ce != nil &&
+		len(ce.cores) == 0 &&
+		ce.after == nil &&
+		len(ce.before) == 0 &&
+		len(ce.afterWrite) == 0 {
+		// No branch selected the entry and nothing else retained the
+		// CheckedEntry, so behave like the entry was disabled.
+		putCheckedEntry(ce)
+		return nil
 	}
 	return ce
 }

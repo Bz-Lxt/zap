@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func withTee(f func(core Core, debugLogs, warnLogs *observer.ObservedLogs)) {
@@ -170,6 +171,93 @@ func TestTeeEnabled(t *testing.T) {
 	for _, tt := range tests {
 		assert.Equal(t, tt.enabled, tee.Enabled(tt.lvl), "Unexpected Enabled result for level %s.", tt.lvl)
 	}
+}
+
+func TestTeeCheckNoBranchSelected(t *testing.T) {
+	// When none of the declared branches select the entry, Check must keep
+	// behaving as if the level were disabled.
+	warnLogger, _ := observer.New(WarnLevel)
+	errorLogger, _ := observer.New(ErrorLevel)
+	tee := NewTee(warnLogger, errorLogger)
+
+	ce := tee.Check(Entry{Level: DebugLevel, Message: "log-at-debug"}, nil)
+	assert.Nil(t, ce, "Expected nil CheckedEntry when no branch selects the entry.")
+}
+
+func TestTeePostWriteResults(t *testing.T) {
+	debugLogger, debugLogs := observer.New(DebugLevel)
+	warnLogger, warnLogs := observer.New(WarnLevel)
+
+	failLogger := NewCore(
+		NewJSONEncoder(testEncoderConfig()),
+		&ztest.FailWriter{},
+		DebugLevel,
+	)
+
+	tee := NewTee(debugLogger, warnLogger, failLogger)
+	ent := Entry{Level: InfoLevel, Message: "log-at-info"}
+
+	var results []WriteResult
+	ce := tee.Check(ent, nil)
+	require.NotNil(t, ce)
+	ce = ce.AfterWrite(ent, func(_ Entry, _ []Field, rs []WriteResult) error {
+		results = rs
+		return nil
+	})
+	ce.Write()
+
+	require.Len(t, results, 3, "Expected one result per declared branch.")
+
+	assert.Equal(t, debugLogger, results[0].Core)
+	assert.Equal(t, WriteSucceeded, results[0].Status)
+	assert.NoError(t, results[0].Err)
+
+	assert.Equal(t, warnLogger, results[1].Core)
+	assert.Equal(t, WriteNotSelected, results[1].Status)
+	assert.Nil(t, results[1].Err)
+
+	assert.Equal(t, failLogger, results[2].Core)
+	assert.Equal(t, WriteFailed, results[2].Status)
+	assert.EqualError(t, results[2].Err, "failed")
+
+	// Delivery still happened to every branch that selected the entry,
+	// despite the failing branch.
+	assert.Equal(t, 1, debugLogs.Len())
+	assert.Equal(t, 0, warnLogs.Len())
+}
+
+func TestTeeNestedPostWriteResults(t *testing.T) {
+	// Nested fan-outs must report their branches in declaration order and
+	// must not deliver entries twice.
+	debugLogger, debugLogs := observer.New(DebugLevel)
+	warnLogger, _ := observer.New(WarnLevel)
+	infoLogger, infoLogs := observer.New(InfoLevel)
+
+	inner := NewTee(debugLogger, warnLogger)
+	outer := NewTee(inner, infoLogger)
+
+	ent := Entry{Level: InfoLevel, Message: "log-at-info"}
+	var results []WriteResult
+	ce := outer.Check(ent, nil)
+	require.NotNil(t, ce)
+	ce = ce.AfterWrite(ent, func(_ Entry, _ []Field, rs []WriteResult) error {
+		results = rs
+		return nil
+	})
+	ce.Write()
+
+	require.Len(t, results, 4)
+	assert.Equal(t, inner, results[0].Core)
+	assert.Equal(t, WriteSucceeded, results[0].Status)
+	assert.Equal(t, debugLogger, results[1].Core)
+	assert.Equal(t, WriteSucceeded, results[1].Status)
+	assert.Equal(t, warnLogger, results[2].Core)
+	assert.Equal(t, WriteNotSelected, results[2].Status)
+	assert.Equal(t, infoLogger, results[3].Core)
+	assert.Equal(t, WriteSucceeded, results[3].Status)
+
+	assert.Equal(t, 1, debugLogs.Len(), "Branch must be written exactly once.")
+	assert.Equal(t, 1, infoLogs.Len(), "Branch must be written exactly once.")
 }
 
 func TestTeeSync(t *testing.T) {
