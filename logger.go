@@ -232,6 +232,131 @@ func (log *Logger) Log(lvl zapcore.Level, msg string, fields ...Field) {
 	}
 }
 
+// BatchEntry is a single structured log record in a batch submitted with
+// [Logger.LogBatch].
+//
+// Only non-terminal levels (DebugLevel, InfoLevel, WarnLevel, and ErrorLevel)
+// are written. Entries at DPanicLevel and above are ignored; use the dedicated
+// [Logger.DPanic], [Logger.Panic], and [Logger.Fatal] methods so that any
+// required panic or process termination still happens.
+type BatchEntry struct {
+	// Level is the level of the log entry.
+	Level zapcore.Level
+	// Message is the log message.
+	Message string
+	// Fields holds the structured fields supplied with the entry.
+	Fields []Field
+}
+
+// LogBatch logs a batch of structured records along the high-throughput path.
+//
+// Every entry is still checked independently against the logger's level and
+// sampling configuration, exactly as if it were logged with [Logger.Log].
+// Entries admitted by the same output are written consecutively in submission
+// order, and concurrent batches never interleave on an output. An error on
+// one output does not prevent the other outputs from completing.
+func (log *Logger) LogBatch(entries ...BatchEntry) {
+	if len(entries) == 0 {
+		return
+	}
+
+	// The Caller captured below identifies this method, and skips past it.
+	const callerSkipOffset = 1
+
+	coreEntries := make([]zapcore.BatchEntry, 0, len(entries))
+	for i := range entries {
+		lvl := entries[i].Level
+		if lvl >= zapcore.DPanicLevel || !log.core.Enabled(lvl) {
+			continue
+		}
+		coreEntries = append(coreEntries, zapcore.BatchEntry{
+			Entry: zapcore.Entry{
+				LoggerName: log.name,
+				Time:       log.clock.Now(),
+				Level:      lvl,
+				Message:    entries[i].Message,
+			},
+			Fields: entries[i].Fields,
+		})
+	}
+	if len(coreEntries) == 0 {
+		return
+	}
+
+	// Annotating caller and stack trace is shared across the batch since all
+	// records share this call site.
+	addCaller := log.addCaller
+	needsStack := false
+	for i := range coreEntries {
+		if log.addStack.Enabled(coreEntries[i].Level) {
+			needsStack = true
+			break
+		}
+	}
+
+	if addCaller || needsStack {
+		stackDepth := stacktrace.First
+		if needsStack {
+			stackDepth = stacktrace.Full
+		}
+		stack := stacktrace.Capture(log.callerSkip+callerSkipOffset, stackDepth)
+		defer stack.Free()
+
+		if stack.Count() == 0 {
+			if addCaller {
+				_, _ = fmt.Fprintf(
+					log.errorOutput,
+					"%v Logger.LogBatch error: failed to get caller\n",
+					log.clock.Now().UTC(),
+				)
+				_ = log.errorOutput.Sync()
+			}
+		} else {
+			frame, more := stack.Next()
+
+			if addCaller {
+				caller := zapcore.EntryCaller{
+					Defined:  frame.PC != 0,
+					PC:       frame.PC,
+					File:     frame.File,
+					Line:     frame.Line,
+					Function: frame.Function,
+				}
+				for i := range coreEntries {
+					coreEntries[i].Caller = caller
+				}
+			}
+
+			if needsStack {
+				buf := bufferpool.Get()
+				defer buf.Free()
+
+				stackfmt := stacktrace.NewFormatter(buf)
+				stackfmt.FormatFrame(frame)
+				if more {
+					stackfmt.FormatStack(stack)
+				}
+				stackStr := buf.String()
+				for i := range coreEntries {
+					if log.addStack.Enabled(coreEntries[i].Level) {
+						coreEntries[i].Stack = stackStr
+					}
+				}
+			}
+		}
+	}
+
+	if err := zapcore.WriteBatch(log.core, coreEntries); err != nil {
+		_, _ = fmt.Fprintf(
+			log.errorOutput,
+			"%v write error: %v\n",
+			log.clock.Now().UTC(),
+			err,
+		)
+		_ = log.errorOutput.Sync()
+	}
+}
+
 // Debug logs a message at DebugLevel. The message includes any fields passed
 // at the log site, as well as any fields accumulated on the logger.
 func (log *Logger) Debug(msg string, fields ...Field) {

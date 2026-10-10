@@ -20,6 +20,12 @@
 
 package zapcore
 
+import (
+	"sync"
+
+	"go.uber.org/zap/internal/bufferpool"
+)
+
 // Core is a minimal, fast logger interface. It's designed for library authors
 // to wrap in a more user-friendly API.
 type Core interface {
@@ -60,6 +66,7 @@ func NewCore(enc Encoder, ws WriteSyncer, enab LevelEnabler) Core {
 		LevelEnabler: enab,
 		enc:          enc,
 		out:          ws,
+		batchMu:      &sync.Mutex{},
 	}
 }
 
@@ -67,11 +74,16 @@ type ioCore struct {
 	LevelEnabler
 	enc Encoder
 	out WriteSyncer
+	// batchMu serializes batch writes to this output, including retries, so
+	// that concurrent batches never interleave. It is shared across Cores
+	// derived with With, since they write to the same output.
+	batchMu *sync.Mutex
 }
 
 var (
 	_ Core           = (*ioCore)(nil)
 	_ leveledEnabler = (*ioCore)(nil)
+	_ BatchCore      = (*ioCore)(nil)
 )
 
 func (c *ioCore) Level() Level {
@@ -109,6 +121,57 @@ func (c *ioCore) Write(ent Entry, fields []Field) error {
 	return nil
 }
 
+// WriteBatch encodes all admitted entries into one staging buffer and writes
+// them to the output with a single write (plus a sync when any entry is above
+// ErrorLevel), so the records appear in the output contiguously and in order.
+//
+// If a write is only partially acknowledged, the write is retried with just
+// the unacknowledged tail. A write that makes no progress aborts the batch
+// and returns its error. The staging buffer is released in either case.
+func (c *ioCore) WriteBatch(entries []BatchEntry) error {
+	c.batchMu.Lock()
+	defer c.batchMu.Unlock()
+
+	staging := bufferpool.Get()
+	defer staging.Free()
+
+	syncAfter := false
+	for i := range entries {
+		buf, err := c.enc.EncodeEntry(entries[i].Entry, entries[i].Fields)
+		if err != nil {
+			return err
+		}
+		staging.AppendBytes(buf.Bytes())
+		buf.Free()
+		if entries[i].Level > ErrorLevel {
+			syncAfter = true
+		}
+	}
+
+	p := staging.Bytes()
+	for len(p) > 0 {
+		n, err := c.out.Write(p)
+		if n > len(p) {
+			n = len(p)
+		}
+		if err != nil {
+			if n > 0 {
+				// Some bytes were acknowledged; on recovery continue only
+				// with the unacknowledged tail.
+				p = p[n:]
+				continue
+			}
+			return err
+		}
+		p = p[n:]
+	}
+
+	if syncAfter {
+		return c.Sync()
+	}
+	return nil
+}
+
 func (c *ioCore) Sync() error {
 	return c.out.Sync()
 }
@@ -118,5 +181,6 @@ func (c *ioCore) clone() *ioCore {
 		LevelEnabler: c.LevelEnabler,
 		enc:          c.enc.Clone(),
 		out:          c.out,
+		batchMu:      c.batchMu,
 	}
 }
